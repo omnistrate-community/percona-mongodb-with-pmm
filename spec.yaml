@@ -1,0 +1,349 @@
+# https://w7.pngwing.com/pngs/956/695/png-transparent-mongodb-original-wordmark-logo-icon-thumbnail.png
+version: "3"
+
+x-omnistrate-service-plan:
+  name: 'MongoDB Dedicated'
+  tenancyType: 'OMNISTRATE_DEDICATED_TENANCY'
+  deployment:
+    hostedDeployment:
+      AwsAccountId: '<>'
+      AwsBootstrapRoleAccountArn: 'arn:aws:iam::<>:role/omnistrate-bootstrap-role'
+
+x-omnistrate-integrations:
+ - omnistrateLogging
+ - omnistrateMetrics
+
+services:
+  pmm-server:
+    x-omnistrate-mode-internal: true
+    x-omnistrate-api-params:
+      - key: pmmServerPassword
+        description: PMM Server Password
+        name: PMM Server Password
+        type: Password
+        modifiable: true
+        required: true
+        export: true
+    x-omnistrate-capabilities:
+      enableMultiZone: true
+      httpReverseProxy:
+        targetPort: 8080
+    x-omnistrate-actionhooks:
+      - scope: NODE
+        type: INIT
+        command:
+        - /bin/bash
+        - -c
+        commandTemplate: |
+          #!/bin/bash
+
+          set -ex
+          echo 'Setting Postgres Data Directory permissions to 0700'
+          if [ -d "/srv/postgres14" ]; then
+              chmod -R 700 /srv/postgres14
+              echo "Permissions updated successfully"
+          else
+              echo "Directory /srv/postgres14 does not exist, skipping permission change"
+          fi
+      - scope: NODE
+        type: POST_START
+        commandTemplate: |
+          #!/bin/bash
+
+          set -ex
+          # Retry a few times before giving up
+          echo "Setting admin password"
+          for i in {1..100}; do
+              if change-admin-password {{ $var.pmmServerPassword }}; then
+                  break
+              fi
+              sleep 6
+          done
+    image: percona/pmm-server:3.0.0
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    user: "1000"
+    group_add:
+      - "1000"
+    volumes:
+      - source: ./pmm-data
+        target: /srv
+        type: bind
+        x-omnistrate-storage:
+          aws:
+            instanceStorageType: AWS::EBS_GP3
+            instanceStorageSizeGi: 700 # Required for metrics retention for 1 year
+            instanceStorageIOPS: 3000
+            instanceStorageThroughput: 125
+          gcp:
+            instanceStorageType: GCP::PD_BALANCED
+            instanceStorageSizeGi: 700 # Required for metrics retention for 1 year
+    environment:
+      - DISABLE_UPDATES=true
+      - DISABLE_TELEMETRY=true
+      - DATA_RETENTION=8760h # 1 year
+      - ENABLE_VM_CACHE=true
+      - DISABLE_ALERTING=true
+      - DISABLE_BACKUP_MANAGEMENT=true
+      - PMM_PUBLIC_ADDRESS={{ $sys.network.externalClusterEndpoint }}
+
+  mongodbserver:
+    x-omnistrate-mode-internal: true
+    x-omnistrate-capabilities:
+      enableMultiZone: true
+      sidecars:
+        pmmclient:
+          imageNameWithTag: percona/pmm-client:3.0.0
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+    image: percona/percona-server-mongodb:6.0.19-multi
+    user: "999"
+    command: mongod --config /etc/mongod.conf
+    depends_on:
+      - pmm-server
+    group_add:
+      - "999"
+    ports:
+      - 27017:27017
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: $var.mongodbUsername
+      MONGO_INITDB_ROOT_PASSWORD: $var.mongodbPassword
+      REPLICA_SET_KEY: $var.mongodbReplicaSetKey
+      PMM_AGENT_SERVER_ADDRESS: "pmm-server:8443"
+      PMM_AGENT_SERVER_USERNAME: "admin"
+      PMM_AGENT_SERVER_PASSWORD: $var.pmmServerPassword
+      PMM_AGENT_SERVER_INSECURE_TLS: 1
+      PMM_AGENT_SETUP: 1
+      PMM_AGENT_SETUP_FORCE: 1
+      PMM_AGENT_CONFIG_FILE: "config/pmm-agent.yaml"
+      PMM_AGENT_PRERUN_SCRIPT: >
+        pmm-admin status --wait=30s &&
+        echo "Waiting for MongoDB server DNS to propagate" &&
+        sleep 180 &&
+        echo "Adding MongoDB server to PMM" &&
+        pmm-admin add mongodb --tls --tls-skip-verify --service-name={{ $sys.compute.node.name }} --username={{ $var.mongodbUsername }} --password={{ $var.mongodbPassword }} --host={{ $sys.network.node.internalEndpoint }} --port=27017 --query-source=profiler   
+    x-omnistrate-actionhooks:
+      - scope: NODE
+        type: INIT
+        command:
+        - /bin/bash
+        - -c
+        commandTemplate: |
+          #!/bin/bash
+
+          set -ex
+          echo -n $REPLICA_SET_KEY > /tmp/replica-set-key-file
+          chmod 400 /tmp/replica-set-key-file
+          chown 999:999 /tmp/replica-set-key-file
+      - scope: CLUSTER
+        type: INIT
+        commandTemplate: |
+          #!/bin/bash
+
+          set -ex
+          mongosh "mongodb://{{ $var.mongodbUsername }}:{{ $var.mongodbPassword }}@{{ $sys.network.nodes[0].internalEndpoint }}:27017/?authMechanism=DEFAULT" --tls --eval 'try { rs.status() } catch (e) { rs.initiate(); }'
+          mongosh "mongodb://{{ $var.mongodbUsername }}:{{ $var.mongodbPassword }}@{{ $sys.network.nodes[0].internalEndpoint }}:27017/?authMechanism=DEFAULT" --tls --eval 'cfg = rs.conf(); cfg.members[0].host = "{{ $sys.network.nodes[0].externalEndpoint }}:27017"; rs.reconfig(cfg)'
+
+      - scope: NODE
+        type: ADD
+        commandTemplate: |
+          #!/bin/bash
+          set -ex
+
+          # Check if NODE_NAME is not equal to 'mongodbserver-0'
+          if [ "$NODE_NAME" != {{ $sys.compute.nodes[0].name }} ]; then
+              # Find the primary node
+              PRIMARY_NODE=$(mongosh "mongodb://{{ $var.mongodbUsername }}:{{ $var.mongodbPassword }}@{{ $sys.network.internalClusterEndpoint }}:27017/?authMechanism=DEFAULT" --tls --eval "rs.isMaster().primary" --quiet)
+              
+              # Run the mongosh command
+              mongosh "mongodb://{{ $var.mongodbUsername }}:{{ $var.mongodbPassword }}@$PRIMARY_NODE/?authMechanism=DEFAULT" --tls --eval "rs.add( { host: '{{ $sys.network.node.externalEndpoint }}:27017' } )"
+          fi
+
+      - scope: NODE
+        type: REMOVE
+        commandTemplate: |
+          #!/bin/bash
+
+          set -ex
+
+          # Check if NODE_NAME is not equal to 'mongodbserver-0'
+          if [ "$NODE_NAME" != {{ $sys.compute.nodes[0].name }} ]; then
+              # Find the primary node
+              PRIMARY_NODE=$(mongosh "mongodb://{{ $var.mongodbUsername }}:{{ $var.mongodbPassword }}@{{ $sys.network.internalClusterEndpoint }}:27017/?authMechanism=DEFAULT" --tls --eval "rs.isMaster().primary" --quiet)
+              
+              # Run the mongosh command
+              mongosh "mongodb://{{ $var.mongodbUsername }}:{{ $var.mongodbPassword }}@$PRIMARY_NODE/?authMechanism=DEFAULT" --tls --eval "rs.remove('{{ $sys.network.node.externalEndpoint }}:27017')"
+          fi
+    x-omnistrate-compute:
+      replicaCountAPIParam: numReplicas
+      instanceTypes:
+        - cloudProvider: aws
+          apiParam: instanceType
+        - cloudProvider: gcp
+          apiParam: instanceType
+    volumes:
+      - ./mongod.conf:/etc/mongod.conf
+      - ./srv:/srv # For PMM Client
+      - source: ./mongodb_master_data
+        target: /data/db
+        type: bind
+        x-omnistrate-storage:
+          aws:
+            instanceStorageType: AWS::EBS_GP3
+            instanceStorageSizeGiAPIParam: instanceStorageSizeGi
+            instanceStorageIOPS: 3000
+            instanceStorageThroughput: 125
+          gcp:
+            instanceStorageType: GCP::PD_BALANCED
+            instanceStorageSizeGiAPIParam: instanceStorageSizeGi
+    x-omnistrate-api-params:
+      - key: instanceType
+        description: Instance Type
+        name: Instance Type
+        type: String
+        modifiable: true
+        required: true
+        export: true
+      - key: mongodbPassword
+        description: Default DB Password
+        name: Password
+        type: String
+        modifiable: false
+        required: true
+        export: false
+      - key: mongodbUsername
+        description: Default DB Username
+        name: Username
+        type: String
+        modifiable: false
+        required: true
+        export: true
+      - key: mongodbReplicaSetKey
+        description: Replica Set Key
+        name: Replica Set Key
+        type: String
+        modifiable: false
+        required: true
+        export: true
+      - key: mongodbReplicaSetName
+        description: Replica Set Name
+        name: Replica Set Name
+        type: String
+        modifiable: false
+        required: true
+        export: true
+      - key: instanceStorageSizeGi
+        description: Instance Storage Size in Gi; Applicable to AWS only
+        name: Instance Storage Size (Gi)
+        type: Float64
+        modifiable: true
+        required: true
+        export: true
+      - key: numReplicas
+        description: Number of Replicas
+        name: Number of Replicas
+        type: Float64
+        modifiable: true
+        required: true
+        export: true
+      - key: pmmServerPassword
+        description: PMM Server Password
+        name: PMM Server Password
+        type: Password
+        modifiable: true
+        required: true
+        export: true
+        parameterDependencyMap:
+          pmm-server: pmmServerPassword
+
+  Cluster:
+    x-omnistrate-mode-internal: false
+    x-omnistrate-capabilities:
+      backupConfiguration:
+        backupRetentionInDays: 30
+        backupPeriodInHours: 24
+    image: omnistrate/noop
+    x-omnistrate-api-params:
+      - key: instanceType
+        description: Instance Type
+        name: Instance Type
+        type: String
+        modifiable: true
+        required: true
+        export: true
+        defaultValue: t4g.small
+        parameterDependencyMap:
+          mongodbserver: instanceType
+      - key: mongodbUsername
+        description: Default DB Username
+        name: Username
+        type: String
+        modifiable: false
+        required: true
+        export: true
+        parameterDependencyMap:
+          mongodbserver: mongodbUsername
+      - key: mongodbPassword
+        description: Default DB Password
+        name: Password
+        type: Password
+        modifiable: false
+        required: true
+        export: true
+        parameterDependencyMap:
+          mongodbserver: mongodbPassword
+      - key: mongodbReplicaSetName
+        description: Replica Set Name
+        name: Replica Set Name
+        type: String
+        modifiable: false
+        required: true
+        export: true
+        parameterDependencyMap:
+          mongodbserver: mongodbReplicaSetName
+      - key: mongodbReplicaSetKey
+        description: Replica Set Key
+        name: Replica Set Key
+        type: Password
+        modifiable: false
+        required: true
+        export: true
+        parameterDependencyMap:
+          mongodbserver: mongodbReplicaSetKey
+      - key: pmmServerPassword
+        description: PMM Server Password
+        name: PMM Server Password
+        type: Password
+        modifiable: true
+        required: true
+        export: true
+        parameterDependencyMap:
+          mongodbserver: pmmServerPassword
+      - key: numReplicas
+        description: Number of Replicas
+        name: Number of Replicas
+        type: Float64
+        modifiable: true
+        required: false
+        export: true
+        defaultValue: "3"
+        limits:
+          min: 3
+          max: 99
+        parameterDependencyMap:
+          mongodbserver: numReplicas
+      - key: instanceStorageSizeGi
+        description: Instance Storage Size in Gi; Applicable to AWS only
+        name: Instance Storage Size (Gi)
+        type: Float64
+        modifiable: true
+        required: false
+        export: true
+        defaultValue: "30"
+        parameterDependencyMap:
+          mongodbserver: instanceStorageSizeGi
+    depends_on:
+      - mongodbserver
